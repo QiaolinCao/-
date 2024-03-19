@@ -42,6 +42,16 @@ class EquationSet:
         sign = self.acceptable[sign]
         self.equations[sign] = value
 
+    def __repr__(self):
+        equation = "x"
+        if "gt" in self.equations:
+            gt_value: float = self.equations["gt"]
+            equation = f"{gt_value} < " + equation
+        if "lt" in self.equations:
+            lt_value: float = self.equations["lt"]
+            equation += f" <= {lt_value}"
+        return f"EquationSet({equation})"
+
     def append_equation(self, sign: str, value: float) -> None:
         """
         添加新的等式
@@ -82,12 +92,12 @@ class DecisionTree:
             divide_method: str,
             pruning_method: str,
             search_method: str,
-            max_depth: int,
-            max_node: int
+            max_depth: Optional[int] = None,
+            max_node: Optional[int] = None
     ) -> None:
         self._node_id: int = 0
         self.nodes: Dict[str, Node] = {}
-        self._temp_termination: Deque[Node] = deque()
+        self.virtual_termination_nodes: Deque[Node] = deque()
         self.leaf_nodes: Dict[str, Node] = {}
 
         self.divide_method: str = divide_method
@@ -99,37 +109,39 @@ class DecisionTree:
         self.train_set: Optional[pd.DataFrame] = None
         self.test_set: Optional[pd.DataFrame] = None
         self.data_structure: Optional[DataStructure] = None
+        self.value_range: Dict[str, List[int]] = {}   # 用于纪录离散属性的取值空间
 
     def gen_new_node_id(self) -> int:
         self._node_id += 1
         return self._node_id - 1
 
     def add_node(self, node: "Node") -> None:
-        self.nodes[str(node.id)] = node
+        new_id: str = str(self.gen_new_node_id())
+        node.set_node_id(new_id)
+        self.nodes[new_id] = node
 
     def add_leaf_node(self, node: "Node") -> None:
-        self.leaf_nodes[str(node.id)] = node
+        self.leaf_nodes[node.node_id] = node
 
-    def add_temp_termination(self, node: "Node") -> None:
+    def add_virtual_termination_node(self, node: "Node") -> None:
         """
-        向队列尾端添加临时终结点
+        向队列尾端添加虚拟终结点
         """
-        self._temp_termination.append(node)
+        self.virtual_termination_nodes.append(node)
 
     def del_node(self, node: "Node") -> None:
-        node_id: str = str(node.id)
-        del self.nodes[node_id]
+        node_id: str = node.node_id
+        if node_id in self.nodes:
+            del self.nodes[node_id]
         if node_id in self.leaf_nodes:
             del self.leaf_nodes[node_id]
-        if node in self._temp_termination:
-            self._temp_termination.remove(node)
-
-        self._node_id -= 1
+        if node in self.virtual_termination_nodes:
+            self.virtual_termination_nodes.remove(node)
 
     def get_test_set_accuracy(self) -> float:
         # 判断节点为所有叶节点，与临时终结点
         df: pd.DataFrame = self.test_set
-        for container in [self.leaf_nodes.values(), self._temp_termination]:
+        for container in [self.leaf_nodes.values(), self.virtual_termination_nodes]:
             for node in container:
                 # 筛选出符合判断节点的测试集数据，并赋予prediction
                 conditions: pd.Series = pd.Series(True, index=df.index)
@@ -149,6 +161,41 @@ class DecisionTree:
         accuracy: float = (df["prediction"] == df[self.data_structure.category]).sum() / len(df)
         return accuracy
 
+    def verify_virtual_node(self, get_v_node: callable) -> None:
+        if self.pruning_method == "prepruning":
+            current_accuracy: float = self.get_test_set_accuracy()
+
+        node: Node = get_v_node()
+
+        if node.check_is_leaf():
+            node.set_node_type("leaf")
+            self.add_node(node)
+            self.add_leaf_node(node)
+        else:
+            # 满足枝节点条件，先判断是否预剪枝
+            if self.pruning_method == "prepruning":
+                child_lst: List[Node] = node.create_child_nodes()
+                accuracy_after_division: float = self.get_test_set_accuracy()
+
+                if accuracy_after_division > current_accuracy:
+                    # 不剪枝, 将节点确认为枝节点
+                    node.set_node_type("branch")
+                    self.add_node(node)
+                else:
+                    # 剪枝，并将节点改为叶节点
+                    while child_lst:
+                        child_node: Node = child_lst.pop()
+                        self.del_node(child_node)
+                        del child_node
+
+                    node.set_node_type("leaf")
+                    self.add_node(node)
+                    self.add_leaf_node(node)
+            else:
+                node.set_node_type("branch")
+                self.add_node(node)
+                node.create_child_nodes()
+
     def fit(
             self,
             train_set: pd.DataFrame,
@@ -160,50 +207,40 @@ class DecisionTree:
         test_set所有列均为属性
         """
         # 预检查
+        if "prediction" in train_set.columns:
+            raise ValueError("'prediction'用于内置命名，列名请勿包含'ct.'")
         for col_name in train_set.columns:
             if "ct." in col_name:
                 raise ValueError("'ct.'用于内置命名，列名请勿包含'ct.'")
 
+        # 赋值
         self.train_set = train_set
         self.test_set = test_set
         self.data_structure = data_structure
+        is_reverse = True if self.search_method == "depth_first" else False
+        for d_attr in data_structure.discrete_attributes:
+            set1 = set(train_set[d_attr])
+            set2 = set(test_set[d_attr])
+            self.value_range[d_attr] = sorted(set1.union(set2), reverse=is_reverse)
+
         root_node: Node = Node(
             self,
             list(train_set.columns[:-1]),
             {},
             self.train_set,
         )
-        self.add_node(root_node)
 
         if self.search_method == "depth_first":
             # 降序队列右侧添加，右侧拿取，后进先出，实现深度优先
-            get_node: Callable = self._temp_termination.pop
+            get_node: Callable = self.virtual_termination_nodes.pop
         elif self.search_method == "breadth_first":
             # 队列右侧添加，左侧拿取，先进先出，实现广度优先
-            get_node: Callable = self._temp_termination.popleft
+            get_node: Callable = self.virtual_termination_nodes.popleft
         else:
             raise ValueError(f"不支持搜索方式{self.search_method}")
 
-        while self._temp_termination:
-            if self.pruning_method == "prepruning":
-                current_accuracy: float = self.get_test_set_accuracy()
-                node: Node = get_node()
-                child_lst: List[Node] = node.create_child_nodes()
-                accuracy_after_division: float = self.get_test_set_accuracy()
-                if accuracy_after_division >= current_accuracy:
-                    # 不剪枝
-                    continue
-                else:
-                    # 剪枝，并将节点改为叶节点
-                    while child_lst:
-                        child_node: Node = child_lst.pop()
-                        child_node.parent.del_child(child_node)
-                        self.del_node(child_node)
-                    self.add_leaf_node(node)
-
-            else:
-                node: Node = get_node()
-                node.create_child_nodes()
+        while self.virtual_termination_nodes:
+            self.verify_virtual_node(get_node)
 
 
 class Node:
@@ -220,23 +257,30 @@ class Node:
             depth: int = 0
     ) -> None:
         self.tree: DecisionTree = tree
-        self.id: int = self.tree.gen_new_node_id()
-        self.tree.add_node(self)
+        self.node_id: str = "None"
 
         self.free_attributes: List[str] = free_attrs
         self.fixed_attributes: Dict[str, Union[int, EquationSet]] = fixed_attrs
         self.data: pd.DataFrame = data
         self.depth: int = depth
 
-        self.parent: Optional[Node] = parent
-        self.children: Dict[str, Node] = {}
+        self.optimal_division: str = "None"
 
-        self.is_leaf: bool = self.check_is_leaf()
+        self.parent: Optional[Node] = parent
+        self.children: List[Node] = []
+
         self.node_prediction: int = self._get_prediction()
-        if self.is_leaf:
-            self.tree.add_leaf_node(self)
-        else:
-            self.tree.add_temp_termination(self)
+
+        # 创建之初，为虚拟节点（可能会被删除），待后续verify
+        self.node_type: str = "virtual"
+        self.tree.add_virtual_termination_node(self)
+
+    def __repr__(self):
+        info = f'''id={self.node_id}, fixed_attributes={self.fixed_attributes}, 
+        optimal_division={self.optimal_division}， node_type={self.node_type}'''
+        if self.node_type == "leaf":
+            info += f", prediction={self.node_prediction}"
+        return f"Node({info})"
 
     def check_is_leaf(self) -> bool:
         # 若该划分下，样本为空
@@ -255,13 +299,17 @@ class Node:
         else:
             return False
 
+    def set_node_id(self, n_id: str) -> None:
+        self.node_id = n_id
+
+    def set_node_type(self, n_type: str) -> None:
+        self.node_type = n_type
+
     def add_child(self, node: "Node") -> None:
-        node_id: str = str(node.id)
-        self.children[node_id] = node
+        self.children.append(node)
 
     def del_child(self, node: "Node") -> None:
-        node_id: str = str(node.id)
-        del self.children[node_id]
+        self.children.remove(node)
 
     def information_gain(self, attr: str) -> float:
         """
@@ -379,24 +427,24 @@ class Node:
         else:
             raise ValueError(f"不支持划分方法：{method}")
 
+        self.optimal_division = optimal_division
         return optimal_division
 
     def create_child_nodes(self) -> List["Node"]:
-        child_lst: List[Node] = []
         # 限制情况
-        if self.depth == self.tree.max_depth:
-            return child_lst
-        node_nums: int = len(self.tree.nodes)
-        if node_nums > self.tree.max_node:
-            return child_lst
+        if self.tree.max_node is not None:
+            if self.depth == self.tree.max_depth:
+                return self.children  # 空列表
+
+        if self.tree.max_node is not None:
+            node_nums: int = len(self.tree.nodes)
+            if node_nums >= self.tree.max_node:
+                return self.children
 
         optimal_division: str = self._get_optimal_division()
 
-        # 判断创建子结点后，加入_temp_termination的方式是升序还是降序
-        if self.tree.search_method == "depth_first":
-            is_reverse = True
-        else:
-            is_reverse = False
+        # 判断创建子结点后，加入virtual_termination_nodes的方式是升序还是降序
+        is_reverse = True if self.tree.search_method == "depth_first" else False
 
         # 判断待划分属性是离散变量还是连续变量
         # 连续变量
@@ -448,7 +496,7 @@ class Node:
 
         # 离散变量
         else:
-            value_range: List[int] = sorted(self.data[optimal_division].unique(), reverse=is_reverse)
+            value_range: List[int] = self.tree.value_range[optimal_division]
             free_attrs: List[str] = copy.copy(self.free_attributes)
             free_attrs.remove(optimal_division)
             for value in value_range:
@@ -465,5 +513,4 @@ class Node:
                 )
                 self.add_child(node)
 
-        return list(self.children.values())
-
+        return self.children
